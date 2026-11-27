@@ -5,9 +5,12 @@ from app.config import DB_PATH
 
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # isolation_level=None：切到 autocommit，由业务层显式 BEGIN IMMEDIATE 接管事务，
+    # 保证撤册与启停并发时写操作在 SQLite 层串行化，杜绝双结局。
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -16,12 +19,26 @@ def db():
     conn = connect()
     try:
         yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
     finally:
         conn.close()
+
+
+@contextmanager
+def tx(conn: sqlite3.Connection):
+    """显式立即事务：同一时刻只允许一个写事务，撤册/启停互斥靠它串行化。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -44,6 +61,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
           sidecar TEXT,
           cpu_quota REAL NOT NULL DEFAULT 1.0,
           mem_quota_mb INTEGER NOT NULL DEFAULT 512,
+          deregister_reason TEXT,
+          deregister_at TEXT,
           FOREIGN KEY(image_id) REFERENCES images(id)
         );
         CREATE TABLE IF NOT EXISTS start_orders (
@@ -54,6 +73,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
           status TEXT NOT NULL,
           note TEXT,
           created_at TEXT NOT NULL,
+          closed_at TEXT,
+          close_reason TEXT,
+          close_run_state TEXT,
           FOREIGN KEY(pod_id) REFERENCES pods(id)
         );
         CREATE TABLE IF NOT EXISTS probes (
@@ -87,5 +109,23 @@ def init_schema(conn: sqlite3.Connection) -> None:
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS deregistrations (
+          id INTEGER PRIMARY KEY,
+          pod_id INTEGER NOT NULL,
+          state TEXT NOT NULL,
+          reason TEXT,
+          pre_run_state TEXT NOT NULL,
+          rollback_reason TEXT,
+          created_at TEXT NOT NULL,
+          finished_at TEXT,
+          rollback_at TEXT,
+          FOREIGN KEY(pod_id) REFERENCES pods(id)
+        );
         """
     )
+    # 旧库幂等迁移：补齐撤册与收口所需列
+    _ensure_column(conn, "pods", "deregister_reason", "TEXT")
+    _ensure_column(conn, "pods", "deregister_at", "TEXT")
+    _ensure_column(conn, "start_orders", "closed_at", "TEXT")
+    _ensure_column(conn, "start_orders", "close_reason", "TEXT")
+    _ensure_column(conn, "start_orders", "close_run_state", "TEXT")
